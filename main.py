@@ -68,21 +68,34 @@ async def whatsapp_webhook(
     # Check if bot is mentioned
     bot_mentioned = is_bot_mentioned(message_text)
     
-    if bot_mentioned and is_group_message:
-        # Handle command in group
-        command = remove_bot_mention(message_text)
-        await handle_group_command(group_id, author, sender_name, command)
-    
-    elif is_group_message:
-        # Store regular group message
-        store_group_message(group_id, author, sender_name, message_text)
-    
+    # Handle different message types
+    if SANDBOX_MODE:
+        # SANDBOX: Check for commands first, then store as group messages
+        message_lower = message_text.lower()
+        
+        if message_lower in ['help', '/help']:
+            handle_dm_command(user_phone, message_text)
+        elif bot_mentioned or message_lower in ['summary', '/summary', '/sum']:
+            # Treat as summary request
+            if bot_mentioned:
+                command = remove_bot_mention(message_text)
+            else:
+                command = message_text
+            await handle_group_command(group_id, author, sender_name, command)
+        else:
+            # Regular message - store it
+            store_group_message(group_id, author, sender_name, message_text)
     else:
-        # Handle DM to bot
-        handle_dm_command(user_phone, message_text)
+        # PRODUCTION: Normal flow
+        if bot_mentioned and is_group_message:
+            command = remove_bot_mention(message_text)
+            await handle_group_command(group_id, author, sender_name, command)
+        elif is_group_message:
+            store_group_message(group_id, author, sender_name, message_text)
+        else:
+            handle_dm_command(user_phone, message_text)
     
     return {"status": "received"}
-
 
 def is_bot_mentioned(message: str) -> bool:
     """Check if bot is mentioned"""
