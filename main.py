@@ -33,6 +33,9 @@ user_last_read = defaultdict(dict)
 print(f"🚀 Bot starting in {'SANDBOX' if SANDBOX_MODE else 'PRODUCTION'} mode")
 
 
+# Add this global variable at the top with other globals
+last_requester = {}  # {group_id: phone_number}
+
 @app.post("/webhook")
 async def whatsapp_webhook(
     From: str = Form(...),
@@ -76,12 +79,15 @@ async def whatsapp_webhook(
         if message_lower in ['help', '/help']:
             handle_dm_command(user_phone, message_text)
         elif bot_mentioned or message_lower in ['summary', '/summary', '/sum']:
+            # Store who requested the summary
+            last_requester[group_id] = user_phone
+            
             # Treat as summary request
             if bot_mentioned:
                 command = remove_bot_mention(message_text)
             else:
                 command = message_text
-            await handle_group_command(group_id, author, sender_name, command)
+            await handle_group_command(group_id, author, sender_name, command, user_phone)
         else:
             # Regular message - store it
             store_group_message(group_id, author, sender_name, message_text)
@@ -89,13 +95,79 @@ async def whatsapp_webhook(
         # PRODUCTION: Normal flow
         if bot_mentioned and is_group_message:
             command = remove_bot_mention(message_text)
-            await handle_group_command(group_id, author, sender_name, command)
+            await handle_group_command(group_id, author, sender_name, command, user_phone)
         elif is_group_message:
             store_group_message(group_id, author, sender_name, message_text)
         else:
             handle_dm_command(user_phone, message_text)
     
     return {"status": "received"}
+
+
+async def handle_group_command(group_id: str, author: str, sender_name: str, command: str, requester_phone: str):
+    """
+    Handle command in the group itself
+    Mentions the person who requested it
+    """
+    
+    print(f"🔍 Parsing command: {command}")
+    
+    # Parse the command using Claude
+    intent = await parse_command_intent(command)
+    
+    print(f"✅ Intent: {intent}")
+    
+    if intent['action'] == 'summarize':
+        time_filter = intent.get('time_filter', 'all')
+        from_last_read = intent.get('from_last_read', False)
+        
+        # Generate summary
+        summary = generate_group_summary(
+            group_id, 
+            author, 
+            time_filter, 
+            from_last_read
+        )
+        
+        # Reply in group mentioning the requester
+        reply = f"@{sender_name}\n\n{summary}"
+        
+        # In sandbox, send directly to requester
+        send_group_message(group_id, reply, requester_phone)
+        
+        # Update last read for this user
+        user_last_read[author][group_id] = datetime.now()
+    
+    else:
+        send_group_message(group_id, 
+            f"@{sender_name} I didn't understand that. Try:\n"
+            "• 'summarize today's chat'\n"
+            "• 'summarize from last read'\n"
+            "• 'catch me up on last 2 hours'",
+            requester_phone)
+
+
+def send_group_message(group_id: str, message: str, requester_phone: str = None):
+    """Send message to the group (or user in sandbox mode)"""
+    try:
+        if SANDBOX_MODE:
+            # In sandbox mode, send to the requester directly
+            to_phone = requester_phone or last_requester.get(group_id)
+            if not to_phone:
+                print("⚠️ No requester phone found, cannot send message")
+                return
+        else:
+            # In production, send to the actual group
+            to_phone = group_id
+        
+        twilio_client.messages.create(
+            from_=os.getenv('TWILIO_WHATSAPP_NUMBER'),
+            to=to_phone,
+            body=message
+        )
+        print(f"✅ Sent to {to_phone}")
+    except Exception as e:
+        print(f"❌ Failed to send message: {e}")
 
 def is_bot_mentioned(message: str) -> bool:
     """Check if bot is mentioned"""
@@ -111,36 +183,7 @@ def remove_bot_mention(message: str) -> str:
     return message.strip()
 
 
-async def handle_group_command(group_id: str, author: str, sender_name: str, command: str):
-    """Handle command in the group itself"""
-    
-    print(f"🔍 Parsing command: {command}")
-    
-    # Parse the command using Claude
-    intent = await parse_command_intent(command)
-    
-    print(f"✅ Intent: {intent}")
-    
-    if intent['action'] == 'summarize':
-        time_filter = intent.get('time_filter', 'all')
-        from_last_read = intent.get('from_last_read', False)
-        
-        # Generate summary
-        summary = generate_group_summary(group_id, author, time_filter, from_last_read)
-        
-        # Reply in group mentioning the requester
-        reply = f"@{sender_name}\n\n{summary}"
-        send_group_message(group_id, reply)
-        
-        # Update last read for this user
-        user_last_read[author][group_id] = datetime.now()
-    
-    else:
-        send_group_message(group_id, 
-            f"@{sender_name} I didn't understand that. Try:\n"
-            "• 'summarize today's chat'\n"
-            "• 'summarize from last read'\n"
-            "• 'catch me up on last 2 hours'")
+
 
 
 async def parse_command_intent(command: str) -> dict:
@@ -354,17 +397,6 @@ def store_group_message(group_id: str, author: str, sender_name: str, text: str)
     print(f"💾 Stored message in {group_id}: {len(group_messages[group_id])} total")
 
 
-def send_group_message(group_id: str, message: str):
-    """Send message to the group"""
-    try:
-        twilio_client.messages.create(
-            from_=os.getenv('TWILIO_WHATSAPP_NUMBER'),
-            to=group_id if not SANDBOX_MODE else os.getenv('TWILIO_WHATSAPP_NUMBER').replace('whatsapp:', ''),
-            body=message
-        )
-        print(f"✅ Sent to group {group_id}")
-    except Exception as e:
-        print(f"❌ Failed to send to group: {e}")
 
 
 def handle_dm_command(user_phone: str, message: str):
