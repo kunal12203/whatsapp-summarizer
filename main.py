@@ -8,9 +8,10 @@ from collections import defaultdict
 import re
 import json
 
+# Load environment variables (for local testing)
 load_dotenv()
 
-app = FastAPI()
+app = FastAPI(title="WhatsApp Summarizer Bot")
 
 # Initialize clients
 twilio_client = Client(
@@ -19,13 +20,17 @@ twilio_client = Client(
 )
 anthropic_client = anthropic.Anthropic(api_key=os.getenv('ANTHROPIC_API_KEY'))
 
-# Data storage
-group_messages = defaultdict(list)  # {group_id: [messages]}
-user_last_read = defaultdict(dict)  # {user_phone: {group_id: timestamp}}
-
-# Token limits
+# Configuration
+SANDBOX_MODE = os.getenv('SANDBOX_MODE', 'true').lower() == 'true'
+SANDBOX_GROUP_ID = "group_test"
 MAX_TOKENS_PER_SUMMARY = 8000
 ESTIMATED_CHARS_PER_TOKEN = 4
+
+# Data storage (use database in production)
+group_messages = defaultdict(list)
+user_last_read = defaultdict(dict)
+
+print(f"🚀 Bot starting in {'SANDBOX' if SANDBOX_MODE else 'PRODUCTION'} mode")
 
 
 @app.post("/webhook")
@@ -35,9 +40,8 @@ async def whatsapp_webhook(
     ProfileName: str = Form(None),
     To: str = Form(...),
     WaId: str = Form(None),
-    # Group-specific fields (available with Business API)
-    Author: str = Form(None),  # Person who sent message in group
-    GroupId: str = Form(None)  # WhatsApp group ID
+    Author: str = Form(None),
+    GroupId: str = Form(None)
 ):
     """
     Receives all WhatsApp messages from groups and DMs
@@ -46,19 +50,26 @@ async def whatsapp_webhook(
     user_phone = From
     message_text = Body.strip()
     sender_name = ProfileName or "Unknown"
-    author = Author or user_phone  # Author is set for group messages
-    group_id = GroupId or user_phone  # GroupId is set for group messages
     
-    print(f"📱 Group: {group_id} | From: {sender_name} ({author}): {message_text}")
-    
-    # Check if this is a group message (has GroupId)
-    is_group_message = GroupId is not None
+    # Handle Sandbox vs Production mode
+    if SANDBOX_MODE:
+        # Sandbox: Simulate all messages as group messages
+        author = user_phone
+        group_id = SANDBOX_GROUP_ID
+        is_group_message = True
+        print(f"📱 [SANDBOX] From: {sender_name} ({user_phone}): {message_text}")
+    else:
+        # Production: Use actual WhatsApp Business API fields
+        author = Author or user_phone
+        group_id = GroupId or user_phone
+        is_group_message = GroupId is not None
+        print(f"📱 [PROD] Group: {group_id} | From: {sender_name} ({author}): {message_text}")
     
     # Check if bot is mentioned
     bot_mentioned = is_bot_mentioned(message_text)
     
     if bot_mentioned and is_group_message:
-        # Extract command and handle in group
+        # Handle command in group
         command = remove_bot_mention(message_text)
         await handle_group_command(group_id, author, sender_name, command)
     
@@ -67,7 +78,7 @@ async def whatsapp_webhook(
         store_group_message(group_id, author, sender_name, message_text)
     
     else:
-        # DM to bot - handle help commands
+        # Handle DM to bot
         handle_dm_command(user_phone, message_text)
     
     return {"status": "received"}
@@ -77,7 +88,6 @@ def is_bot_mentioned(message: str) -> bool:
     """Check if bot is mentioned"""
     message_lower = message.lower()
     bot_triggers = ['@bot', '@summarizer', 'hey bot', 'bot summarize', 'summarize']
-    
     return any(trigger in message_lower for trigger in bot_triggers)
 
 
@@ -89,25 +99,21 @@ def remove_bot_mention(message: str) -> str:
 
 
 async def handle_group_command(group_id: str, author: str, sender_name: str, command: str):
-    """
-    Handle command in the group itself
-    Mentions the person who requested it
-    """
+    """Handle command in the group itself"""
+    
+    print(f"🔍 Parsing command: {command}")
     
     # Parse the command using Claude
     intent = await parse_command_intent(command)
+    
+    print(f"✅ Intent: {intent}")
     
     if intent['action'] == 'summarize':
         time_filter = intent.get('time_filter', 'all')
         from_last_read = intent.get('from_last_read', False)
         
         # Generate summary
-        summary = generate_group_summary(
-            group_id, 
-            author, 
-            time_filter, 
-            from_last_read
-        )
+        summary = generate_group_summary(group_id, author, time_filter, from_last_read)
         
         # Reply in group mentioning the requester
         reply = f"@{sender_name}\n\n{summary}"
@@ -129,7 +135,7 @@ async def parse_command_intent(command: str) -> dict:
     
     try:
         response = anthropic_client.messages.create(
-            model="claude-3-5-haiku",
+            model="claude-3-5-haiku-20241022",
             max_tokens=200,
             temperature=0,
             system="""You are a command parser for a WhatsApp summarizer bot.
@@ -164,9 +170,7 @@ Examples:
 
 
 def generate_group_summary(group_id: str, author: str, time_filter: str, from_last_read: bool) -> str:
-    """
-    Generate summary for the group
-    """
+    """Generate summary for the group"""
     
     if group_id not in group_messages or not group_messages[group_id]:
         return "📝 No messages to summarize yet!"
@@ -183,7 +187,7 @@ def generate_group_summary(group_id: str, author: str, time_filter: str, from_la
     filtered_messages = apply_token_limit(filtered_messages)
     
     # Generate summary
-    summary = generate_summary(filtered_messages, time_filter, len(all_messages))
+    summary = generate_summary(filtered_messages, time_filter)
     
     msg_count = len(filtered_messages)
     time_info = get_time_range_text(time_filter, from_last_read)
@@ -271,7 +275,7 @@ def get_time_range_text(time_filter: str, from_last_read: bool) -> str:
     return time_map.get(time_filter, "")
 
 
-def generate_summary(messages: list, time_filter: str, total_messages: int) -> str:
+def generate_summary(messages: list, time_filter: str) -> str:
     """Generate AI summary using Claude"""
     
     # Format messages
@@ -342,7 +346,7 @@ def send_group_message(group_id: str, message: str):
     try:
         twilio_client.messages.create(
             from_=os.getenv('TWILIO_WHATSAPP_NUMBER'),
-            to=group_id,  # In Business API, this is the group's WhatsApp ID
+            to=group_id if not SANDBOX_MODE else os.getenv('TWILIO_WHATSAPP_NUMBER').replace('whatsapp:', ''),
             body=message
         )
         print(f"✅ Sent to group {group_id}")
@@ -402,7 +406,11 @@ def send_dm(to_phone: str, message: str):
 
 @app.get("/")
 async def root():
-    return {"status": "WhatsApp Summarizer Bot is running!"}
+    return {
+        "status": "WhatsApp Summarizer Bot is running!",
+        "mode": "sandbox" if SANDBOX_MODE else "production",
+        "version": "1.0.0"
+    }
 
 
 @app.get("/health")
@@ -413,6 +421,7 @@ async def health():
     
     return {
         "status": "healthy",
+        "mode": "sandbox" if SANDBOX_MODE else "production",
         "total_groups": len(group_messages),
         "total_messages": total_messages,
         "total_users_tracking": total_users,
@@ -420,29 +429,32 @@ async def health():
     }
 
 
-@app.get("/stats/{group_id}")
-async def group_stats(group_id: str):
-    """Get stats for a specific group"""
-    if group_id not in group_messages:
-        return {"error": "Group not found"}
+@app.get("/stats")
+async def stats():
+    """Get detailed statistics"""
+    group_stats = {}
     
-    messages = group_messages[group_id]
-    senders = {}
-    
-    for msg in messages:
-        sender = msg['sender']
-        senders[sender] = senders.get(sender, 0) + 1
+    for group_id, messages in group_messages.items():
+        senders = {}
+        for msg in messages:
+            sender = msg['sender']
+            senders[sender] = senders.get(sender, 0) + 1
+        
+        group_stats[group_id] = {
+            "total_messages": len(messages),
+            "unique_senders": len(senders),
+            "top_sender": max(senders.items(), key=lambda x: x[1])[0] if senders else None,
+            "oldest_message": messages[0]['timestamp'].isoformat() if messages else None,
+            "newest_message": messages[-1]['timestamp'].isoformat() if messages else None
+        }
     
     return {
-        "group_id": group_id,
-        "total_messages": len(messages),
-        "unique_senders": len(senders),
-        "top_senders": sorted(senders.items(), key=lambda x: x[1], reverse=True)[:5],
-        "oldest_message": messages[0]['timestamp'].isoformat() if messages else None,
-        "newest_message": messages[-1]['timestamp'].isoformat() if messages else None
+        "groups": group_stats,
+        "total_users": len(user_last_read)
     }
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
